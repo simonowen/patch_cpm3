@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Patching tool for NABU PC CP/M 3 disk images (v1.0).
+# Patching tool for NABU PC CP/M 3 disk images (v1.1).
 #
 # Usage: python patch_cpm3.py <disk image>
 #
@@ -31,7 +31,7 @@ boottrk = 1
 reclen = 128
 
 # Read and patch the given disk image, outputting the patched image to a new file.
-def main(args):
+def main():
     imgsize = os.path.getsize(args.file)
     if not imgsize in diskdefs:
         valid = ', '.join([str(s) for s in sorted(diskdefs.keys())])
@@ -44,59 +44,78 @@ def main(args):
     with open(args.file, 'rb') as f:
         disk = bytearray(f.read())
 
-    if disk[0x3e6:0x3ee] == bytes.fromhex("4E4E4E4E04050607"):
-        raise RuntimeError("Disk image is already patched")
-
-    disk = patch_cpm3_sys(disk)
-    disk = patch_boot_loader(disk)
+    disk_before = bytes(disk)
     disk = patch_boot_sector(disk)
+    disk = patch_boot_loader(disk)
+    disk = patch_cpm3_sys(disk)
 
-    basename, ext = os.path.splitext(args.file)
-    filename = f"{basename}_patched{ext}"
-    with open(filename, 'wb') as f:
-        f.write(bytes(disk))
-    print(f"Wrote: {filename}")
+    if disk != disk_before:
+        basename, ext = os.path.splitext(args.file)
+        filename = f"{basename}_patched{ext}"
+        with open(filename, 'wb') as f:
+            f.write(bytes(disk))
+        print(f"Written to {filename}")
 
 # Add DPB to end of boot sector, prefixed by 4E bytes to pad up to 32 bytes.
 def patch_boot_sector(disk):
     block_len = 32
     dpb_block = bytes([0x4e] * (block_len - len(bytes.fromhex(dpbhex)))) + bytes.fromhex(dpbhex)
+
+    old_block = disk[seclen-block_len:seclen]
+    if old_block == dpb_block:
+        print("Boot sector: already patched")
+        return disk
+
+    if old_block == bytes(old_block[0:1] * block_len):
+        pass # allow common filler
+    elif not any((x+i) & 0xff != old_block[0] for x, i in enumerate(old_block)):
+        pass # allow decrementing pattern
+    elif args.force:
+        pass # patch if forced
+    else:
+        raise RuntimeError("Boot sector: unrecognised, will not update without --force option")
+
     disk[seclen-block_len:seclen] = dpb_block
-    print("Added DPB to boot sector")
+    print("Boot sector: added DPB")
+
     return disk
 
-# Patch cpmldr to read DPB from end of first sector.
+# Patch CPMLDR to read DPB from end of first sector.
 def patch_boot_loader(disk):
     start, end = seclen, seclen * sectrk
     code = disk[start:end]
 
-    code = patch_code(code, 0x100)
+    if code == bytes(code[0:1] * (end - start)):
+        print("CPMLDR: not found, skipping")
+    else:
+        code = patch_code(code, "CPMLDR")
+        disk[start:end] = code
 
-    disk[start:end] = code
-    print("Patched cpmldr")
     return disk
 
 # Patch CPM3.SYS to read DPB from end of first sector.
 def patch_cpm3_sys(disk):
     entry = find_file(disk, "cpm3.sys")
+    if entry is None:
+        print("CPM3.SYS: file not found, skipping")
+        return disk
+
     nrecords = entry[15]
     blockidx = list(filter(lambda n: n > 0, struct.unpack("16B", entry[16:32])))
     recoffsets = [block_offset(b, r) for b in blockidx for r in range(blocksize // reclen)][:nrecords]
 
-    base_addr = (disk[recoffsets[0]+0] - disk[recoffsets[0]+1]) << 8
     if disk[recoffsets[0]+3] != 0:
-        raise RuntimeError("Second CP/M 3 sub-block is not currently supported")
+        print("CPM3.SYS: ignoring second CP/M 3 sub-block")
 
     nrecords = disk[recoffsets[0]+1] * (256 // reclen)
     recoffsets = list(reversed(recoffsets[2:2+nrecords]))
     code = bytearray().join([read_record(disk, o) for o in recoffsets])
 
-    code = patch_code(code, base_addr)
+    code = patch_code(code, "CPM3.SYS")
 
     for r in range(nrecords):
         disk[recoffsets[r]:recoffsets[r]+reclen] = code[r*reclen:(r+1)*reclen]
 
-    print("Patched CPM3.SYS")
     return disk
 
 # Find a named CP/M file entry in the directory.
@@ -113,16 +132,28 @@ def find_file (disk, filename):
         if entry[0] != 0xe5 and entry[1:12] == name_match:
             return entry
 
-    raise RuntimeError(f"CP/M file not found: {filename}")
+    return None
 
 # Patch the DPB reading in the given block of code.
-def patch_code(code, base_addr):
+def patch_code(code, filename):
     # Find  ld a,READ_TRACK ; CALL exec_fdc_cmd  at start of patch area.
     start0, end0, wild0 = find_pattern(code, '3EE0CD????4A')
+    if start0 is None:
+        start0, end0, wild0 = find_pattern(code, '4B0D3E01ED793E88CD')
+        if start0 is not None:
+            print(f"{filename}: already patched")
+        else:
+            print(f"{filename}: no code to patch, skipping")
+        return code
+
     exec_fdc_cmd = ''.join([b.hex().upper() for b in wild0])
 
     # Find next  CALL read_fdc_data ; jr exit  at end of patch.
     start1, end1, _ = find_pattern(code, 'CD????18??', end0)
+    if start1 is None:
+        print(f"{filename}: end of patch not found, skipping")
+        return code
+
     fail_offset = end1 - start0 - 21
     done_offset = start1 - start0 - 32
 
@@ -150,12 +181,13 @@ def patch_code(code, base_addr):
 
     target_size = start1 - start0
     if target_size < len(patch):
-        raise RuntimeError("Patch target is too small, code is incompatible")
+        print("{filename}: patch target is too small, skipping")
     elif target_size >= 0x80:
-        raise RuntimeError("Patch target is suspiciously large, code likely incompatible")
-
-    patch = patch + b'\x00' * (target_size - len(patch))
-    code[start0:start1] = patch
+        print("{filename}: patch target is suspiciously large, skipping")
+    else:
+        patch = patch + b'\x00' * (target_size - len(patch))
+        code[start0:start1] = patch
+        print(f"{filename}: code patched")
 
     return code
 
@@ -166,12 +198,13 @@ def find_pattern(code, hexpattern, start=0):
 
     pattern = ''.join(['(.)' if b == '??' else f'\\x{b}' for b in re.findall('..', hexpattern)])
     matches = list(re.finditer(bytes(pattern, 'ascii'), code_copy, re.MULTILINE))
-    if len(matches) == 0:
-        raise RuntimeError(f"{hexpattern} not matched, code is incompatible")
-    elif len(matches) > 1:
-        raise RuntimeError(f"{hexpattern} matches mutiple locations, patch is too generic")
 
-    return matches[0].start(), matches[0].end(), matches[0].groups()
+    if (len(matches) == 1):
+        return matches[0].start(), matches[0].end(), matches[0].groups()
+
+    if len(matches) > 1:
+        print(f"warning: {hexpattern} matches mutiple locations, patch is too generic")
+    return None, None, None
 
 # Calculate the disk offset of the given CP/M block number and sub-record.
 def block_offset(blockno, record=0):
@@ -196,9 +229,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Patch DPB reading in NABU PC CP/M 3 disk images.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-f', '--force', action='store_true', help="Force patching boot sector")
     parser.add_argument('file')
     try:
-        main(parser.parse_args())
+        global args
+        args = parser.parse_args()
+        main()
     except Exception as e:
         print(e)
         exit(1)
