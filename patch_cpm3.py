@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
-# Patching tool for NABU PC CP/M 3 disk images (v1.1).
+# Patching tool for NABU PC CP/M 3 disk images (v1.2).
 #
 # Usage: python patch_cpm3.py <disk image>
 #
-# This script patches NABU CP/M 3 disk images to move the Disk Parameter Block
-# (DPB) to the end of the boot sector. The cpmldr and CPM3.SYS code is then
-# patched to read it from there instead.
+# This script patches NABU CP/M 3 disk images to add a Disk Parameter Block
+# (DPB) to the end of the boot sector. The CPMLDR and CPM3.SYS code is then
+# patched to read it from there if it wasn't found at the start of track 0.
 #
 # The patched image is saved out to a new file with a '_patched' suffix.
 #
@@ -88,7 +88,7 @@ def patch_boot_loader(disk):
     if code == bytes(code[0:1] * (end - start)):
         print('CPMLDR: not found, skipping')
     else:
-        code = patch_code(code, 'CPMLDR')
+        code = patch_code(code, 0x100, 'C53ED0DD4E0EED793E103D20FDC1C9', 'CPMLDR')
         disk[start:end] = code
 
     return disk
@@ -104,6 +104,7 @@ def patch_cpm3_sys(disk):
     blockidx = list(filter(lambda n: n > 0, struct.unpack('16B', entry[16:32])))
     recoffsets = [block_offset(b, r) for b in blockidx for r in range(blocksize // reclen)][:nrecords]
 
+    base_addr = (disk[recoffsets[0]+0] - disk[recoffsets[0]+1]) << 8
     if disk[recoffsets[0]+3] != 0:
         print('CPM3.SYS: ignoring second CP/M 3 sub-block')
 
@@ -111,7 +112,7 @@ def patch_cpm3_sys(disk):
     recoffsets = list(reversed(recoffsets[2:2+nrecords]))
     code = bytearray().join([read_record(disk, o) for o in recoffsets])
 
-    code = patch_code(code, 'CPM3.SYS')
+    code = patch_code(code, base_addr, 'F13DC2????676FC9????', 'CPM3.SYS')
 
     for r in range(nrecords):
         disk[recoffsets[r]:recoffsets[r]+reclen] = code[r*reclen:(r+1)*reclen]
@@ -135,75 +136,104 @@ def find_file (disk, filename):
     return None
 
 # Patch the DPB reading in the given block of code.
-def patch_code(code, filename):
-    # Find  ld a,READ_TRACK ; CALL exec_fdc_cmd  at start of patch area.
-    start0, end0, wild0 = find_pattern(code, '3EE0CD????4A')
+def patch_code(code, base_addr, last_code, filename):
+    start0, end0, wild0 = find_pattern(code, 'FEA128??FEFE28??FE4E20??')
     if start0 is None:
-        start0, end0, wild0 = find_pattern(code, '4B0D3E01ED793E88CD')
-        if start0 is not None:
-            print(f'{filename}: already patched')
-        else:
-            print(f'{filename}: no code to patch, skipping')
+        print(f'{filename}: no code to patch, skipping')
         return code
 
-    exec_fdc_cmd = ''.join([b.hex().upper() for b in wild0])
+    exit_off = start0 + 8 + struct.unpack('b', wild0[1])[0]
+    fail_off = start0 + 12 + struct.unpack('b', wild0[2])[0]
 
-    # Find next  CALL read_fdc_data ; jr exit  at end of patch.
-    start1, end1, _ = find_pattern(code, 'CD????18??', end0)
-    if start1 is None:
-        print(f'{filename}: end of patch not found, skipping')
+    read_ret = hex_string(struct.pack('H', base_addr + end0))
+    exit_ret = hex_string(struct.pack('H', base_addr + exit_off + 3))
+    fail_ret = hex_string(struct.pack('H', base_addr + fail_off + 3))
+
+    _, patch_off, _ = find_pattern(code, last_code)
+    patch_jp = bytes.fromhex('C3' + hex_string(struct.pack('H', base_addr + patch_off)))
+
+    exit_code = hex_string(code[exit_off:exit_off+3])
+    if exit_code == hex_string(patch_jp):
+        print(f'{filename}: already patched')
         return code
 
-    fail_offset = end1 - start0 - 21
-    done_offset = start1 - start0 - 32
+    wait_ready = find_pattern(code, 'C506C8DD4E??ED781F3803AFC1C9')[0]
+    force_int = find_pattern(code, 'C5{4}3ED0{3}ED79')[0]
+    exec_cmd = find_pattern(code, 'C5F5{5}CD????F1DD4E??ED793E0E3D20FDC1C9')[0]
+    read_dpb = find_pattern(code, '26022E4E4AED78A428FB')[0]
+
+    if patch_off is None:
+        raise RuntimeError(f'{filename}: failed to find patch free space')
+    elif wait_ready is None:
+        raise RuntimeError(f'{filename}: failed to find wait_ready code')
+    elif force_int is None:
+        raise RuntimeError(f'{filename}: failed to find force_interrupt code')
+    elif exec_cmd is None:
+        raise RuntimeError(f'{filename}: failed to find exec_cmd code')
+    elif read_dpb is None:
+        raise RuntimeError(f'{filename}: failed to find read_dpb code')
+
+    wait_ready = hex_string(struct.pack('H', base_addr + wait_ready))
+    force_int = hex_string(struct.pack('H', base_addr + force_int))
+    exec_cmd = hex_string(struct.pack('H', base_addr + exec_cmd))
+    read_dpb = hex_string(struct.pack('H', base_addr + read_dpb))
 
     patch = bytes.fromhex(
         f'4B'                   # ld   c,e            ; FDC data port
         f'0D'                   # dec  c              ; FDC sector port
+        f'CD{force_int}'        # call force_int      ; stop READ_TRACK command
+        f'CD{wait_ready}'       # call wait_ready     ; wait for FDC ready
         f'3E01'                 # ld   a,1            ; sector 1
         f'ED79'                 # out  (c),a          ; select sector for command
         f'3E88'                 # ld   a,&88          ; READ SECTOR
-        f'CD{exec_fdc_cmd}'     # call exec_fdc_cmd   ; execute FDC command
-        f'261F'                 # ld   h,31           ; 31 blocks...
-        f'0620'                 # ld   b,32           ; ...of 32 bytes
+        f'CD{exec_cmd}'         # call exec_cmd       ; execute FDC command
+        f'21E103'               # ld   hl,&03e1       ; read up to 4E gap bytes
         f'4A'                   # ld   c,d            ; FDC status port
         f'ED78'                 # in   a,(c)          ; read FDC status
         f'1F'                   # rra                 ; busy?
-        f'30{fail_offset:02X}'  # jr   nc,exit        ; jump if not busy (command finished)
+        f'3018'                 # jr   nc,fail        ; jump if not busy (command finished)
         f'1F'                   # rra                 ; drq?
         f'30F8'                 # jr   nc,wait_data   ; jump back if no data available
         f'4B'                   # ld   c,e            ; FDC data port
         f'ED78'                 # in   a,(c)          ; read (and discard) FDC data
-        f'10F2'                 # djnz block_lp       ; loop to finish block of 32
-        f'25'                   # dec  h              ; next block
-        f'28{done_offset:02X}'  # jr   z,continue     ; jump if all done (to CALL after patch)
-        f'18EB')                # jr   blocks_lp      ; complete remaining blocks
+        f'2B'                   # dec  hl             ; decrement byte counter
+        f'7C'                   # ld   a,h
+        f'B5'                   # or   l
+        f'20EF'                 # jr   nz,block_lp    ; loop to read rest
+        f'ED78'                 # in   a,(c)          ; re-read, also underrun protection
+        f'FE4E'                 # cp   &4E            ; gap byte?
+        f'CA{read_ret}'         # jp   z,read_ret     ; if so, jump back to read DPB
+        f'{exit_code}'          # 3 bytes of code     ; original code from hook point
+        f'C3{exit_ret}'         # jp   exit_ret       ; return to caller to exit
+        f'C3{fail_ret}')        # jp   fail_ret       ; return to caller to fail
 
-    target_size = start1 - start0
-    if target_size < len(patch):
-        print('{filename}: patch target is too small, skipping')
-    elif target_size >= 0x80:
-        print('{filename}: patch target is suspiciously large, skipping')
-    else:
-        patch = patch + b'\x00' * (target_size - len(patch))
-        code[start0:start1] = patch
-        print(f'{filename}: code patched')
+    known_code = ('3E01C9', 'CD????')
+    if not any(find_pattern(bytes.fromhex(exit_code), p)[0] is not None for p in known_code):
+        raise RuntimeError(f'{filename}: unconfirmed patch code [{exit_code}]')
+
+    code[exit_off:exit_off+3] = patch_jp
+    code[fail_off:fail_off+3] = patch_jp
+    code[patch_off:patch_off+len(patch)] = patch
+    print(f'{filename}: code patched')
 
     return code
 
-# Find a byte pattern in a block of code, with wildcard matching.
+# Find a byte pattern in a block of code, with optional blocks and wildcards.
 def find_pattern(code, hexpattern, start=0):
     code_copy = bytearray(code)
     code_copy[:start] = b'\x00' * start
 
-    pattern = ''.join(['(.)' if b == '??' else f'\\x{b}' for b in re.findall('..', hexpattern)])
-    matches = list(re.finditer(bytes(pattern, 'ascii'), code_copy, re.MULTILINE))
+    pattern = hexpattern.replace('??', '(.)')
+    pattern = re.sub(r'{(\d+)}', r'(?:.{\1})?', pattern)
+    pattern = re.sub(r'([0-9A-F]{2})(?![}])', r'\\x\1', pattern, flags=re.IGNORECASE)
+    matches = list(re.finditer(bytes(pattern, 'ascii'), code_copy, re.MULTILINE|re.DOTALL))
 
     if (len(matches) == 1):
         return matches[0].start(), matches[0].end(), matches[0].groups()
 
     if len(matches) > 1:
-        print(f'warning: {hexpattern} matches mutiple locations, patch is too generic')
+        raise RuntimeError(f'{hexpattern} matches mutiple code locations')
+
     return None, None, None
 
 # Calculate the disk offset of the given CP/M block number and sub-record.
@@ -224,6 +254,9 @@ def block_offset(blockno, record=0):
 def read_record(disk, offset):
     return disk[offset:offset+reclen]
 
+# Convert a byte array to a hex string.
+def hex_string(data):
+    return ''.join([f'{b:02X}' for b in data])
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(

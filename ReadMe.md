@@ -18,11 +18,13 @@ There's plenty of spare space at the end of the boot sector so the DPB can be st
 
 ![Sector View](images/sector1_dpb.png)
 
-There are two places that read the DPB: the second stage loader (CPMLDR) and the main CPM3.SYS program. Code in both can be patched to read the DPB from this new location.
+There are two places that read the DPB: the second stage loader (CPMLDR) and the main CPM3.SYS program. Code in both can be patched to read the DPB from this new location, if needed.
 
-The patch changes the READ_TRACK command to a READ_1SECTOR, and reads up to final 32 bytes in the sector. Control then continues to the existing DPB reading code, which expects to find a run of 4E padding bytes then the DPB data block.
+The patch inserts a hook to catch when the raw track reading fails to find a DPB. This happens when it encounters an IDAM (`FE` byte) after an `A1` sync byte instead of the expected `4E` filler that leads up to the DPB data. If this happens the hook leads to new code that reads the boot sector to look for a DPB in the last 32 bytes.
 
-The first 4 bytes of the data block are a fixed `04 05 06 07` pattern as written by the format.com program, which aren't actually checked by anything. The next byte is a disk type, which is one of `00`, `01` or `02`, representing 40x1 / 40x2 / 80x2 disk formats. The final 17 bytes are the actual DPB that contains the CP/M parameters.
+If a DPB is not found in either location the behaviour depends on the program. CPMLDR just hangs the system after a failed attempt to display an error message. CPM3.SYS has another try at finding a DPB, matching the format of the first track against a table with 4 entries: 5x1024, 16x128 (FM), 9x512 (DOS), 10x512. If a match is found a DPB stored with the matched entry is used for the disk, allowing some non-NABU disks to be used.
+
+The DPB data starts with a run of 4E bytes, used to indicate the DPB is present. This is followed by a fixed `04 05 06 07` pattern as written by the format.com program, which aren't actually checked by anything. The next byte is a disk type, which is one of `00`, `01` or `02`, representing 40x1 / 40x2 / 80x2 disk formats. The final 17 bytes are the actual DPB containing CP/M parameters.
 
 The script updates the boot sector to add a DPB block to the end, and attempts to patch CPMLDR and the CPM3.SYS file if they are found. The DPB used depends on the size of the raw disk image, so make sure that is correct. The patched image is written out to a new file with a `_patched` suffix.
 
