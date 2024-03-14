@@ -18,10 +18,10 @@ import struct
 import argparse
 
 diskdefs = {
-    # size:[ tracks, blocksize, maxdir, DPB ]
-    204800:[ 40,1024, 96, '04050607002800030700C2005F00E000001801000307'],
-    409600:[ 80,2048,192, '04050607012800040F01C400BF00E000003001000307'],
-    819200:[160,2048,384, '04050607022800040F008C017F01FC00006101000307'] }
+    # size:[ tracks, blocksize, maxdir, dpbhex, fmtname ]
+    204800:[ 40,1024, 96, '04050607002800030700C2005F00E000001801000307', 's4'],
+    409600:[ 80,2048,192, '04050607012800040F01C400BF00E000003001000307', 's8'],
+    819200:[160,2048,384, '04050607022800040F008C017F01FC00006101000307', 'd16'] }
 
 # Common parameters for all NABU disk images.
 seclen = 1024
@@ -37,8 +37,8 @@ def main():
         valid = ', '.join([str(s) for s in sorted(diskdefs.keys())])
         raise RuntimeError(f'Invalid disk image size ({imgsize}), supported sizes: {valid}')
 
-    global tracks, blocksize, maxdir, dpbhex
-    tracks, blocksize, maxdir, dpbhex = diskdefs[imgsize]
+    global tracks, blocksize, maxdir, dpbhex, fmtname
+    tracks, blocksize, maxdir, dpbhex, fmtname = diskdefs[imgsize]
 
     print(f'Reading: {args.file}')
     with open(args.file, 'rb') as f:
@@ -113,6 +113,17 @@ def patch_cpm3_sys(disk):
     code = bytearray().join([read_record(disk, o) for o in recoffsets])
 
     code = patch_code(code, base_addr, 'F13DC2????676FC9????', 'CPM3.SYS')
+
+    # Optionally patch the default DPB used for NABU format disks without a DPB.
+    if args.default != None:
+        start, _, _ = find_pattern(code, '002800030700B8003F00C000001003000307')
+        if start is None:
+            print('Default NABU DPB: already patched')
+        else:
+            dpbhex = [v[3] for k, v in diskdefs.items() if v[4] == args.default][0]
+            default_dpb = bytes.fromhex(dpbhex)[-17:]
+            code[start:start+len(default_dpb)] = default_dpb
+            print(f'Default NABU DPB: {args.default} format')
 
     for r in range(nrecords):
         disk[recoffsets[r]:recoffsets[r]+reclen] = code[r*reclen:(r+1)*reclen]
@@ -263,6 +274,8 @@ if __name__ == '__main__':
         description='Patch DPB reading in NABU PC CP/M 3 disk images.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-f', '--force', action='store_true', help='Force patching boot sector')
+    parser.add_argument('-d', '--default', choices=['s4','d8','d16'],
+                        help='Replace fallback DPB for NABU disks: s4, d8, d16.')
     parser.add_argument('file')
     try:
         global args

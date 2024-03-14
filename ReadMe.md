@@ -31,7 +31,7 @@ The script updates the boot sector to add a DPB block to the end, and attempts t
 ## Usage
 
 ```
-usage: patch_cpm3.py [-h] [-f] file
+usage: patch_cpm3.py [-h] [-f] [-d {s4,d8,d16}] file
 
 Patch DPB reading in NABU PC CP/M 3 disk images.
 
@@ -39,8 +39,10 @@ positional arguments:
   file
 
 options:
-  -h, --help   show this help message and exit
-  -f, --force  Force patching boot sector (default: False)
+  -h, --help            show this help message and exit
+  -f, --force           Force patching boot sector (default: False)
+  -d {s4,d8,d16}, --default {s4,d8,d16}
+                        Replace fallback DPB for NABU disks: s4, d8, d16. (default: None)
 ```
 
 ### Example
@@ -54,10 +56,13 @@ Reading: disk.img
 Boot sector: added DPB
 CPMLDR: code patched
 CPM3.SYS: code patched
+Default NABU DPB: d16 format
 Written to disk_patched.img
 ```
 
 If the end of the boot sector contains unexpected data it will not be overwritten. If you're happy it's safe you can force it to be updated with the `--force` option.
+
+CP/M 3 allows access to NABU format disks that don't have an embedded DPB, using a built-in default DPB. This is s4 format by default, which is 40 tracks single-sided. Use the `-d` option to set this to a different format. For example, `-d d16` selects 80 tracks double-sided as the default. Note: `-d s4` set the same DPB as the format.com program, which is slightly different to the CP/M 3 internal default.
 
 ## Credits
 
