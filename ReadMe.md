@@ -56,7 +56,6 @@ Reading: disk.img
 Boot sector: added DPB
 CPMLDR: code patched
 CPM3.SYS: code patched
-Default NABU DPB: d16 format
 Written to disk_patched.img
 ```
 
@@ -75,5 +74,5 @@ patch_cpm3.py is released under the [MIT license](https://tldrlegal.com/license/
 
 ## Contact
 
-Simon Owen
+Simon Owen  
 [https://simonowen.com](https://simonowen.com)
